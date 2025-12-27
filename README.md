@@ -1,4 +1,7 @@
+
 # GitHub Action TUI: Monitor & Trigger Workflows
+
+![Screenshot of GitHub Action TUI](action-check.png)
 
 A Textual-based Terminal User Interface (TUI) for monitoring and managing GitHub Actions workflows across your repositories.
 

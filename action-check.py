@@ -1,5 +1,3 @@
-print("Starting cicd_monitor.py")
-
 import asyncio
 import os
 
@@ -21,7 +19,14 @@ RUNS = []  # Will be filled after repo selection
 
 class RepoList(ListView):
     def __init__(self, repos, **kwargs):
-        super().__init__(*[ListItem(Static(repo)) for repo in repos], **kwargs)
+        # Repos are passed in as full_name (e.g. "user/repo"); only show the repo name.
+        super().__init__(
+            *[
+                ListItem(Static(repo.split("/")[-1] if isinstance(repo, str) else repo))
+                for repo in repos
+            ],
+            **kwargs,
+        )
 
 
 class WorkflowList(ListView):
@@ -34,7 +39,14 @@ class WorkflowList(ListView):
 class RunList(ListView):
     def __init__(self, runs, **kwargs):
         super().__init__(
-            *[ListItem(Static(f"{run['name']} [{run['status']}]")) for run in runs],
+            *[
+                ListItem(
+                    Static(
+                        f"{run.get('created', run.get('name', '?'))} [{run['status']}]"
+                    )
+                )
+                for run in runs
+            ],
             **kwargs,
         )
 
@@ -56,6 +68,16 @@ class WrappedLog(Static):
 
 
 class CICDMonitorApp(App):
+    # Helper for pretty column headers
+    @staticmethod
+    def pretty_header(text, width=22, color="magenta"):
+        line = "─" * width
+        pad = max((width - len(text)) // 2, 0)
+        centered = (
+            " " * pad + f"[{color} bold]{text}[/]" + " " * (width - len(text) - pad)
+        )
+        return f"{line}\n{centered}\n{line}"
+
     BINDINGS = [
         ("left", "focus_prev_column", "Focus previous column"),
         ("right", "focus_next_column", "Focus next column"),
@@ -72,7 +94,6 @@ class CICDMonitorApp(App):
         self.columns = ["repo-list", "workflow-list", "run-list"]
         self.focused_column = 0
         self._pending_action = None
-        print("CICDMonitorApp __init__ called")
 
     async def on_mount(self):
         print("CICDMonitorApp mounted")
@@ -98,6 +119,85 @@ class CICDMonitorApp(App):
         elif col_id == "run-list":
             self.set_focus(self.run_list)
 
+    def compose(self) -> ComposeResult:
+        """Compose the UI layout and dynamic banner."""
+        from rich.console import Console
+
+        console = Console()
+        try:
+            banner_width = console.size.width
+        except Exception:
+            banner_width = 80
+        banner_width = max(banner_width, 60)  # Minimum width for aesthetics
+
+        app_name = "CICDMonitorApp"
+        author = "Greg Heffner"
+        repo_url = "https://github.com/gregheffner/action-check"
+        app_name_str = f"[bold magenta]{app_name}[/]"
+        author_str = f"[cyan]Created by {author}[/]"
+        repo_str = f"[yellow]Repo: {repo_url}[/]"
+
+        def center_text(text: str, width: int) -> str:
+            import re
+
+            plain = re.sub(r"\[.*?\]", "", text)
+            pad = max((width - len(plain)) // 2, 0)
+            return " " * pad + text + " " * (width - len(plain) - pad)
+
+        top = "╔" + "═" * (banner_width - 2) + "╗"
+        mid = (
+            "║"
+            + center_text(app_name_str, banner_width - 2)
+            + "║\n"
+            + "║"
+            + center_text(author_str, banner_width - 2)
+            + "║\n"
+            + "║"
+            + center_text(repo_str, banner_width - 2)
+            + "║"
+        )
+        bot = "╚" + "═" * (banner_width - 2) + "╝"
+        banner_text = f"{top}\n{mid}\n{bot}"
+
+        yield Static(banner_text, classes="banner", expand=False, markup=True)
+        yield Header()
+
+        with Horizontal():
+            with Vertical():
+                yield Static(
+                    self.pretty_header("Repositories", 22, "magenta"),
+                    classes="title",
+                    markup=True,
+                )
+                self.repo_list = RepoList(self.repos, id="repo-list")
+                yield self.repo_list
+            with Vertical():
+                yield Static(
+                    self.pretty_header("Workflows", 22, "cyan"),
+                    classes="title",
+                    markup=True,
+                )
+                self.workflow_list = WorkflowList(self.workflows, id="workflow-list")
+                yield self.workflow_list
+            with Vertical():
+                yield Static(
+                    self.pretty_header("Recent Runs", 22, "yellow"),
+                    classes="title",
+                    markup=True,
+                )
+                self.run_list = RunList(self.runs, id="run-list")
+                yield self.run_list
+            with Vertical():
+                yield Static(
+                    self.pretty_header("Logs", 22, "green"),
+                    classes="title",
+                    markup=True,
+                )
+                self.log_view = WrappedLog(id="log-view", expand=True)
+                yield self.log_view
+
+        yield Footer()
+
     # CSS_PATH = "cicd_monitor.tcss"
     selected_repo = reactive(None)
     selected_workflow = reactive(None)
@@ -105,28 +205,6 @@ class CICDMonitorApp(App):
     repos = reactive([])
     workflows = reactive([])
     runs = reactive([])
-
-    def compose(self) -> ComposeResult:
-        print("CICDMonitorApp compose called")
-        yield Header()
-        with Horizontal():
-            with Vertical():
-                yield Static("Repositories", classes="title")
-                self.repo_list = RepoList(self.repos, id="repo-list")
-                yield self.repo_list
-            with Vertical():
-                yield Static("Workflows", classes="title")
-                self.workflow_list = WorkflowList(self.workflows, id="workflow-list")
-                yield self.workflow_list
-            with Vertical():
-                yield Static("Recent Runs", classes="title")
-                self.run_list = RunList(self.runs, id="run-list")
-                yield self.run_list
-            with Vertical():
-                yield Static("Logs", classes="title")
-                self.log_view = WrappedLog(id="log-view", expand=True)
-                yield self.log_view
-        yield Footer()
 
     async def on_mount(self):
         print("CICDMonitorApp mounted")
@@ -165,7 +243,13 @@ class CICDMonitorApp(App):
                 self.repos = [f"Error: {resp.status_code}"]
         self.repo_list.clear()
         for repo in self.repos:
-            self.repo_list.append(ListItem(Static(repo)))
+            # Display only the short repo name (part after '/'),
+            # but keep the full name in self.repos for API calls.
+            if isinstance(repo, str) and "/" in repo and not repo.startswith("Error"):
+                display = repo.split("/")[-1]
+            else:
+                display = repo
+            self.repo_list.append(ListItem(Static(display)))
         # Auto-load workflows for first repo
         if self.repos:
             await self.load_workflows(self.repos[0])
@@ -241,7 +325,8 @@ class CICDMonitorApp(App):
                                 "id": run["id"],
                                 "status": run["conclusion"] or run["status"],
                                 "name": workflow_name,
-                                "log": f"Run ID: {run['id']}\nStatus: {run['conclusion'] or run['status']}\nDate: {created_fmt}",
+                                "created": created_fmt,
+                                "log": f"Run ID: {run['id']}\nStatus: {run['conclusion'] or run['status']}",
                             }
                         )
                 else:
@@ -255,7 +340,9 @@ class CICDMonitorApp(App):
                     ]
         self.run_list.clear()
         for run in self.runs:
-            self.run_list.append(ListItem(Static(f"{run['name']} [{run['status']}]")))
+            self.run_list.append(
+                ListItem(Static(f"{run.get('created', run['name'])} [{run['status']}]"))
+            )
         self.update_log_view(0)
 
     async def on_list_view_highlighted(self, event):
@@ -274,7 +361,7 @@ class CICDMonitorApp(App):
             workflow = self.workflows[idx]
             await self.load_runs(repo_name, workflow["id"], workflow["name"])
         elif event.list_view.id == "run-list":
-            self.update_log_view(idx)
+            await self.show_detailed_log(idx, open_browser=True)
 
     # Keep on_list_view_selected for explicit selection (e.g., Enter key)
     async def on_list_view_selected(self, event):
@@ -287,76 +374,133 @@ class CICDMonitorApp(App):
             workflow = self.workflows[event.list_view.index]
             await self.load_runs(repo_name, workflow["id"], workflow["name"])
         elif event.list_view.id == "run-list":
-            self.update_log_view(event.list_view.index)
+            await self.show_detailed_log(event.list_view.index, open_browser=True)
 
     def update_log_view(self, run_index):
         self.log_view.clear()
         if 0 <= run_index < len(self.runs):
             self.log_view.write(self.runs[run_index]["log"])
 
-    async def action_trigger_workflow(self):
-        repo_index = self.repo_list.index
-        workflow_index = self.workflow_list.index
-        if (
-            repo_index is None
-            or workflow_index is None
-            or repo_index < 0
-            or workflow_index < 0
-        ):
-            self.log_view.write("[ERROR] No repo or workflow selected.")
-            return
-        repo_name = self.repos[repo_index]
-        workflow = self.workflows[workflow_index]
-        workflow_id = workflow["id"]
-        ref = "main"
-        self.log_view.write(
-            f"[CONFIRM] Press 'y' to confirm triggering workflow '{workflow['name']}', any other key to cancel."
-        )
-        self._pending_action = ("trigger", repo_name, workflow)
+    async def show_detailed_log(self, run_index, open_browser: bool = False):
+        """Show detailed information for a run and print its GitHub URL."""
 
-    async def action_rerun_job(self):
-        run_index = self.run_list.index
-        if run_index is None or run_index < 0:
-            self.log_view.write("[ERROR] No job selected.")
+        self.log_view.clear()
+
+        if not (0 <= run_index < len(self.runs)):
             return
+
         run = self.runs[run_index]
-        self.log_view.write(
-            f"[CONFIRM] Press 'y' to confirm re-running job '{run['name']}', any other key to cancel."
-        )
-        self._pending_action = ("rerun", run)
+        repo_index = self.repo_list.index
+        repo_name = self.repos[repo_index] if repo_index is not None else None
+        run_id = run["id"]
 
-    async def on_key(self, event):
-        if hasattr(self, "_pending_action") and self._pending_action:
-            if event.key == "y":
-                action = self._pending_action
-                self._pending_action = None
-                if action[0] == "trigger":
-                    repo_name, workflow = action[1], action[2]
-                    await self._do_trigger_workflow(repo_name, workflow)
-                elif action[0] == "rerun":
-                    run = action[1]
-                    await self._do_rerun_job(run)
-            else:
-                self.log_view.write("[INFO] Action canceled.")
-                self._pending_action = None
+        details = None
+        if repo_name and run_id:
+            try:
+                details = await self.fetch_run_details(repo_name, run_id)
+            except Exception as e:
+                self.log_view.write(f"[ERROR] Could not fetch details: {e}")
 
-    async def _do_trigger_workflow(self, repo_name, workflow):
-        workflow_id = workflow["id"]
-        ref = "main"
+        log_text = run["log"]
+
+        if details:
+            log_text += f"\nActor: {details.get('actor', '?')}"
+            log_text += f"\nDuration: {details.get('duration', '?')}"
+            if details.get("steps"):
+                log_text += "\nSteps:"
+                for step in details["steps"]:
+                    log_text += (
+                        f"\n- {step['name']}: {step['status']}"
+                        f" ({step.get('conclusion', '')})"
+                    )
+                    if step.get("error"):
+                        log_text += f"\n  Error: {step['error']}"
+        else:
+            log_text += "\n[INFO] No extra details available."
+
+        if repo_name and run_id:
+            log_url = f"https://github.com/{repo_name}/actions/runs/{run_id}"
+            log_text += (
+                f"\n[INFO] Log URL: {log_url}\n"
+                "Copy and paste this URL into your browser."
+            )
+
+        self.log_view.write(log_text)
+
+    async def fetch_run_details(self, repo_name: str, run_id: int):
+        """Fetch additional details for a workflow run.
+
+        Returns a dict with optional keys: actor, duration, steps.
+        """
+
+        if not GITHUB_TOKEN:
+            return None
+
         headers = {
             "Authorization": f"token {GITHUB_TOKEN}",
             "Accept": "application/vnd.github+json",
         }
-        self.log_view.write(f"[ACTION] Triggering workflow '{workflow['name']}'...")
-        async with httpx.AsyncClient() as client:
-            dispatch_url = f"{GITHUB_API}/repos/{repo_name}/actions/workflows/{workflow_id}/dispatches"
-            resp = await client.post(dispatch_url, headers=headers, json={"ref": ref})
-            if resp.status_code in (201, 204):
-                self.log_view.write("[INFO] Workflow dispatch triggered.")
-            else:
-                self.log_view.write(
-                    f"[ERROR] Failed to trigger workflow: HTTP {resp.status_code}\n{resp.text}"
-                )
+
+        url = f"{GITHUB_API}/repos/{repo_name}/actions/runs/{run_id}/jobs"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=headers)
+        except Exception as exc:
+            self.log_view.write(
+                f"[WARN] Failed to contact GitHub for run details: {exc}"
+            )
+            return None
+
+        if resp.status_code != 200:
+            self.log_view.write(
+                f"[WARN] Could not fetch job details: HTTP {resp.status_code}"
+            )
+            return None
+
+        data = resp.json() or {}
+        jobs = data.get("jobs") or []
+        if not jobs:
+            return None
+
+        job = jobs[0]
+
+        # Derive actor information if available
+        actor = job.get("runner_name") or job.get("runner_group_name") or "?"
+
+        # Compute duration from started_at/completed_at
+        from datetime import datetime
+
+        started_at = job.get("started_at")
+        completed_at = job.get("completed_at")
+        duration = "?"
+        if started_at and completed_at:
+            try:
+                start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                delta = end_dt - start_dt
+                total_seconds = int(delta.total_seconds())
+                minutes, seconds = divmod(max(total_seconds, 0), 60)
+                if minutes:
+                    duration = f"{minutes}m {seconds}s"
+                else:
+                    duration = f"{seconds}s"
+            except Exception:
+                duration = "?"
+
+        steps_data = []
+        for step in job.get("steps") or []:
+            failure_details = step.get("failure_details") or {}
+            steps_data.append(
+                {
+                    "name": step.get("name", "?"),
+                    "status": step.get("status", "?"),
+                    "conclusion": step.get("conclusion"),
+                    "error": failure_details.get("message"),
+                }
+            )
+
+        return {"actor": actor, "duration": duration, "steps": steps_data}
 
     async def _do_rerun_job(self, run):
         self.log_view.write(f"[ACTION] Re-running job '{run['name']}'...")

@@ -492,6 +492,7 @@ class CICDMonitorApp(App):
             lines.append("")
             lines.append("─" * 40)
             lines.append(f"[bold]Log URL:[/] {log_url}")
+            lines.append("")
             lines.append("Copy and paste this URL into your browser.")
 
         self.log_view.write("\n".join(lines))

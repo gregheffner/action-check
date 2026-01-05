@@ -17,6 +17,29 @@ GITHUB_API = "https://api.github.com"
 RUNS = []  # Will be filled after repo selection
 
 
+def remove_emojis(text: str) -> str:
+    """Return *text* with common emoji characters removed.
+
+    GitHub Action step names often include emoji; the TUI log view should
+    render plain text only.
+    """
+
+    if not isinstance(text, str):
+        return ""
+
+    cleaned = "".join(
+        ch
+        for ch in text
+        if not (
+            0x1F300 <= ord(ch) <= 0x1FAFF
+            or 0x1F600 <= ord(ch) <= 0x1F64F
+            or 0x2600 <= ord(ch) <= 0x26FF
+            or 0x2700 <= ord(ch) <= 0x27BF
+        )
+    )
+    return cleaned.strip()
+
+
 class RepoList(ListView):
     def __init__(self, repos, **kwargs):
         # Repos are passed in as full_name (e.g. "user/repo"); only show the repo name.
@@ -382,7 +405,7 @@ class CICDMonitorApp(App):
             self.log_view.write(self.runs[run_index]["log"])
 
     async def show_detailed_log(self, run_index, open_browser: bool = False):
-        """Show detailed information for a run and print its GitHub URL."""
+        """Show detailed information for a run in a compact, readable format."""
 
         self.log_view.clear()
 
@@ -394,6 +417,21 @@ class CICDMonitorApp(App):
         repo_name = self.repos[repo_index] if repo_index is not None else None
         run_id = run["id"]
 
+        # Base run status used for the header
+        raw_status = str(run.get("status", run.get("conclusion", "?")) or "?")
+        status_lower = raw_status.lower()
+        if status_lower in ("success", "completed"):
+            status_color, status_label = "green", "SUCCESS"
+        elif status_lower in ("failure", "failed", "cancelled", "timed_out"):
+            status_color, status_label = "red", "FAILURE"
+        elif status_lower in ("neutral", "skipped", "action_required"):
+            status_color, status_label = (
+                "yellow",
+                status_lower.replace("_", " ").upper(),
+            )
+        else:
+            status_color, status_label = "cyan", raw_status.upper()
+
         details = None
         if repo_name and run_id:
             try:
@@ -401,31 +439,62 @@ class CICDMonitorApp(App):
             except Exception as e:
                 self.log_view.write(f"[ERROR] Could not fetch details: {e}")
 
-        log_text = run["log"]
+        actor = details.get("actor", "?") if details else "?"
+        duration = details.get("duration", "?") if details else "?"
 
-        if details:
-            log_text += f"\nActor: {details.get('actor', '?')}"
-            log_text += f"\nDuration: {details.get('duration', '?')}"
-            if details.get("steps"):
-                log_text += "\nSteps:"
-                for step in details["steps"]:
-                    log_text += (
-                        f"\n- {step['name']}: {step['status']}"
-                        f" ({step.get('conclusion', '')})"
+        lines = []
+        # Compact header line
+        header = (
+            f"[bold]Run ID:[/] {run_id}    "
+            f"[bold]Status:[/] [{status_color}]{status_label}[/]    "
+            f"[bold]Actor:[/] {actor}    "
+            f"[bold]Duration:[/] {duration}"
+        )
+        lines.append(header)
+
+        steps = details.get("steps") if details else None
+        if steps:
+            lines.append("")
+            lines.append("[bold underline]Steps[/bold underline]:")
+            for step in steps:
+                raw_name = step.get("name", "?")
+                name = remove_emojis(raw_name) or "?"
+                step_status_raw = step.get("conclusion") or step.get("status") or "?"
+                step_status_str = str(step_status_raw)
+                step_lower = step_status_str.lower()
+                if step_lower in ("success", "completed"):
+                    step_color, step_label = "green", "SUCCESS"
+                elif step_lower in (
+                    "failure",
+                    "failed",
+                    "cancelled",
+                    "timed_out",
+                ):
+                    step_color, step_label = "red", "FAILURE"
+                elif step_lower in ("neutral", "skipped", "action_required"):
+                    step_color, step_label = (
+                        "yellow",
+                        step_lower.replace("_", " ").upper(),
                     )
-                    if step.get("error"):
-                        log_text += f"\n  Error: {step['error']}"
+                else:
+                    step_color, step_label = "cyan", step_status_str.upper()
+
+                line = f"- {name}: [{step_color}]{step_label}[/]"
+                if step.get("error"):
+                    line += f" - [red]{step['error']}[/]"
+                lines.append(line)
         else:
-            log_text += "\n[INFO] No extra details available."
+            lines.append("")
+            lines.append("[INFO] No step details available.")
 
         if repo_name and run_id:
             log_url = f"https://github.com/{repo_name}/actions/runs/{run_id}"
-            log_text += (
-                f"\n[INFO] Log URL: {log_url}\n"
-                "Copy and paste this URL into your browser."
-            )
+            lines.append("")
+            lines.append("─" * 40)
+            lines.append(f"[bold]Log URL:[/] {log_url}")
+            lines.append("Copy and paste this URL into your browser.")
 
-        self.log_view.write(log_text)
+        self.log_view.write("\n".join(lines))
 
     async def fetch_run_details(self, repo_name: str, run_id: int):
         """Fetch additional details for a workflow run.

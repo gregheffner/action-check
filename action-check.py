@@ -1,5 +1,7 @@
 import asyncio
 import os
+import random
+import string
 
 import httpx
 from dotenv import load_dotenv
@@ -74,6 +76,126 @@ class RunList(ListView):
         )
 
 
+class MatrixBanner(Static):
+    """Animated "Matrix"-style banner with static centered text.
+
+    The interior area shows falling characters while the author and
+    repository lines remain readable in the middle of the box.
+    """
+
+    def __init__(self, width: int, height: int, author: str, repo: str) -> None:
+        super().__init__("", classes="banner", expand=False, markup=True)
+        # Ensure minimum sensible dimensions
+        self.width = max(width, 60)
+        # Height must allow top+bottom borders, two text lines, and matrix rows
+        self.height = max(height, 7)
+
+        self.inner_width = self.width - 2
+        self.inner_height = self.height - 2
+
+        self.author_str = author
+        self.repo_str = repo
+
+        # Choose rows (inside the box) for the static text
+        center = self.inner_height // 2
+        self.author_row = max(0, center - 1)
+        self.repo_row = min(self.inner_height - 1, center)
+
+        # Character set for the matrix effect
+        self._charset = "01" + string.ascii_uppercase
+
+        # Tail length controls how long each vertical stream remains visible.
+        # Use the full interior height so streams can travel top-to-bottom.
+        self.tail_length = self.inner_height
+
+        # Persistent character and age grids for the interior area. We shift
+        # these downward every frame to create clear vertical motion.
+        self._chars = [
+            [" " for _ in range(self.inner_width)] for _ in range(self.inner_height)
+        ]
+        self._ages = [
+            [self.tail_length for _ in range(self.inner_width)]
+            for _ in range(self.inner_height)
+        ]
+
+    def on_mount(self) -> None:  # type: ignore[override]
+        # Update the banner about 10 times per second
+        self.set_interval(0.1, self.animate)
+
+    def _center_text(self, text: str) -> str:
+        import re
+
+        # Strip Rich markup to compute visual width
+        plain = re.sub(r"\[.*?\]", "", text)
+        pad = max((self.inner_width - len(plain)) // 2, 0)
+        return " " * pad + text + " " * max(self.inner_width - len(plain) - pad, 0)
+
+    def animate(self) -> None:
+        # Shift existing characters down one row to create vertical motion.
+        for y in range(self.inner_height - 1, 0, -1):
+            for x in range(self.inner_width):
+                self._chars[y][x] = self._chars[y - 1][x]
+                self._ages[y][x] = self._ages[y - 1][x] + 1
+
+        # Spawn new heads at the top row with some probability per column.
+        for x in range(self.inner_width):
+            if random.random() < 0.35:
+                self._chars[0][x] = random.choice(self._charset)
+                self._ages[0][x] = 0
+            else:
+                # Age out any previous character at the top
+                self._ages[0][x] = self.tail_length
+
+        # Build a frame from the current chars/ages with appropriate colors.
+        frame = [
+            [" " for _ in range(self.inner_width)] for _ in range(self.inner_height)
+        ]
+
+        for y in range(self.inner_height):
+            for x in range(self.inner_width):
+                ch = self._chars[y][x]
+                age = self._ages[y][x]
+                if not ch or age >= self.tail_length:
+                    continue
+                if age == 0:
+                    frame[y][x] = f"[bright_green]{ch}[/]"
+                else:
+                    frame[y][x] = f"[green]{ch}[/]"
+
+        lines = []
+
+        # Top border
+        lines.append("╔" + "═" * self.inner_width + "╗")
+
+        # Interior
+        import re
+
+        for row in range(self.inner_height):
+            row_cells = frame[row][:]
+
+            if row == self.author_row or row == self.repo_row:
+                text = self.author_str if row == self.author_row else self.repo_str
+                # Compute starting column using plain length (without markup)
+                plain = re.sub(r"\[.*?\]", "", text)
+                start = max((self.inner_width - len(plain)) // 2, 0)
+                start = min(start, max(self.inner_width - len(plain), 0))
+
+                # Left side retains matrix characters
+                left = "".join(row_cells[:start])
+                # Right side also keeps matrix characters after the text span
+                right = "".join(row_cells[start + len(plain) :])
+                inner = left + text + right
+            else:
+                inner = "".join(row_cells)
+
+            lines.append("║" + inner + "║")
+
+        # Bottom border
+        lines.append("╚" + "═" * self.inner_width + "╝")
+
+        self.update("\n".join(lines))
+
+
 class WrappedLog(Static):
     def __init__(self, *args, **kwargs):
         super().__init__("", *args, **kwargs)
@@ -143,52 +265,43 @@ class CICDMonitorApp(App):
             self.set_focus(self.run_list)
 
     def compose(self) -> ComposeResult:
-        """Compose the UI layout and dynamic banner."""
+        """Compose the UI layout and dynamic, animated banner."""
         from rich.console import Console
 
         console = Console()
         try:
-            banner_width = console.size.width
+            term_size = console.size
+            banner_width = term_size.width
+            term_height = term_size.height
         except Exception:
             banner_width = 80
-        banner_width = max(banner_width, 60)  # Minimum width for aesthetics
+            term_height = 24
+        banner_width = max(banner_width, 60)
 
-        app_name = "CICDMonitorApp"
-        author = "Greg Heffner"
-        repo_url = "https://github.com/gregheffner/action-check"
-        app_name_str = f"[bold magenta]{app_name}[/]"
-        author_str = f"[cyan]Created by {author}[/]"
-        repo_str = f"[yellow]Repo: {repo_url}[/]"
+        # Make the banner tall enough that vertical motion is obvious,
+        # but not so tall that it dominates smaller terminals.
+        banner_height = max(9, min(14, term_height // 3))
 
-        def center_text(text: str, width: int) -> str:
-            import re
+        # Derive a reasonable column header width from the banner/terminal width
+        # so that column names appear visually centered within their panes.
+        # Keep a sensible minimum to avoid overly narrow headers.
+        column_width = max((banner_width // 4) - 4, 22)
 
-            plain = re.sub(r"\[.*?\]", "", text)
-            pad = max((width - len(plain)) // 2, 0)
-            return " " * pad + text + " " * (width - len(plain) - pad)
+        author_str = "[cyan]Created by Greg Heffner[/]"
+        repo_str = "[yellow]Repo: https://github.com/gregheffner/action-check[/]"
 
-        top = "╔" + "═" * (banner_width - 2) + "╗"
-        mid = (
-            "║"
-            + center_text(app_name_str, banner_width - 2)
-            + "║\n"
-            + "║"
-            + center_text(author_str, banner_width - 2)
-            + "║\n"
-            + "║"
-            + center_text(repo_str, banner_width - 2)
-            + "║"
+        yield MatrixBanner(
+            width=banner_width,
+            height=banner_height,
+            author=author_str,
+            repo=repo_str,
         )
-        bot = "╚" + "═" * (banner_width - 2) + "╝"
-        banner_text = f"{top}\n{mid}\n{bot}"
-
-        yield Static(banner_text, classes="banner", expand=False, markup=True)
         yield Header()
 
         with Horizontal():
             with Vertical():
                 yield Static(
-                    self.pretty_header("Repositories", 22, "magenta"),
+                    self.pretty_header("Repositories", column_width, "magenta"),
                     classes="title",
                     markup=True,
                 )
@@ -196,7 +309,7 @@ class CICDMonitorApp(App):
                 yield self.repo_list
             with Vertical():
                 yield Static(
-                    self.pretty_header("Workflows", 22, "cyan"),
+                    self.pretty_header("Workflows", column_width, "cyan"),
                     classes="title",
                     markup=True,
                 )
@@ -204,7 +317,7 @@ class CICDMonitorApp(App):
                 yield self.workflow_list
             with Vertical():
                 yield Static(
-                    self.pretty_header("Recent Runs", 22, "yellow"),
+                    self.pretty_header("Recent Runs", column_width, "yellow"),
                     classes="title",
                     markup=True,
                 )
@@ -212,7 +325,7 @@ class CICDMonitorApp(App):
                 yield self.run_list
             with Vertical():
                 yield Static(
-                    self.pretty_header("Logs", 22, "green"),
+                    self.pretty_header("Logs", column_width, "green"),
                     classes="title",
                     markup=True,
                 )

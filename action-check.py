@@ -255,6 +255,45 @@ class CICDMonitorApp(App):
             self.focused_column += 1
             self._focus_column()
 
+    def action_trigger_workflow(self):
+        """Key binding: trigger the currently selected workflow run on GitHub."""
+
+        repo_index = getattr(self.repo_list, "index", None)
+        workflow_index = getattr(self.workflow_list, "index", None)
+        if (
+            repo_index is None
+            or workflow_index is None
+            or not self.repos
+            or not self.workflows
+        ):
+            self.log_view.write("[WARN] No repository or workflow selected.")
+            return
+
+        repo_name = self.repos[repo_index]
+        workflow = self.workflows[workflow_index]
+        if not isinstance(workflow, dict) or workflow.get("id") in (None, 0):
+            self.log_view.write("[WARN] Selected workflow cannot be triggered.")
+            return
+
+        asyncio.create_task(
+            self._do_trigger_workflow(
+                repo_name=repo_name,
+                workflow_id=workflow["id"],
+                workflow_name=workflow.get("name", "(unnamed)"),
+            )
+        )
+
+    def action_rerun_job(self):
+        """Key binding: re-run the currently selected job (workflow run)."""
+
+        run_index = getattr(self.run_list, "index", None)
+        if run_index is None or not self.runs:
+            self.log_view.write("[WARN] No run selected to re-run.")
+            return
+
+        run = self.runs[run_index]
+        asyncio.create_task(self._do_rerun_job(run))
+
     def _focus_column(self):
         col_id = self.columns[self.focused_column]
         if col_id == "repo-list":
@@ -530,8 +569,21 @@ class CICDMonitorApp(App):
         repo_name = self.repos[repo_index] if repo_index is not None else None
         run_id = run["id"]
 
-        # Base run status used for the header
+        # Base run status used for the header; may be overridden by
+        # fresher data from fetch_run_details (job conclusion).
         raw_status = str(run.get("status", run.get("conclusion", "?")) or "?")
+
+        details = None
+        if repo_name and run_id:
+            try:
+                details = await self.fetch_run_details(repo_name, run_id)
+            except Exception as e:
+                self.log_view.write(f"[ERROR] Could not fetch details: {e}")
+
+        # Prefer job-level conclusion when available so status is up to date.
+        if details and details.get("job_conclusion"):
+            raw_status = str(details.get("job_conclusion") or raw_status)
+
         status_lower = raw_status.lower()
         if status_lower in ("success", "completed"):
             status_color, status_label = "green", "SUCCESS"
@@ -544,13 +596,6 @@ class CICDMonitorApp(App):
             )
         else:
             status_color, status_label = "cyan", raw_status.upper()
-
-        details = None
-        if repo_name and run_id:
-            try:
-                details = await self.fetch_run_details(repo_name, run_id)
-            except Exception as e:
-                self.log_view.write(f"[ERROR] Could not fetch details: {e}")
 
         actor = details.get("actor", "?") if details else "?"
         duration = details.get("duration", "?") if details else "?"
@@ -609,6 +654,80 @@ class CICDMonitorApp(App):
             lines.append("Copy and paste this URL into your browser.")
 
         self.log_view.write("\n".join(lines))
+
+        # Update in-memory status and the label in the runs list so the
+        # column no longer shows stale states like "queued" once the job
+        # has completed.
+        try:
+            # Mutate stored run data
+            self.runs[run_index]["status"] = raw_status
+
+            # Update visual label for this run list item
+            label = f"{run.get('created', run.get('name', '?'))} [{raw_status}]"
+            item = self.run_list.children[run_index]
+            # The text widget should be the first (and only) child
+            text_widget = item.children[0]
+            if isinstance(text_widget, Static):
+                text_widget.update(label)
+        except Exception:
+            # If for any reason the UI structure is different, ignore; the
+            # header still shows the correct, up-to-date status.
+            pass
+
+    async def _do_trigger_workflow(
+        self, repo_name: str, workflow_id: int, workflow_name: str
+    ):
+        """Dispatch a new run of the given workflow via GitHub's API."""
+
+        if not GITHUB_TOKEN:
+            self.log_view.write(
+                "[ERROR] GITHUB_TOKEN is not configured; cannot trigger."
+            )
+            return
+
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        self.log_view.write(
+            f"[ACTION] Triggering workflow '{workflow_name}' for repo '{repo_name}'..."
+        )
+
+        default_ref = "main"
+        try:
+            async with httpx.AsyncClient() as client:
+                # Try to discover the default branch for the repo
+                try:
+                    repo_resp = await client.get(
+                        f"{GITHUB_API}/repos/{repo_name}", headers=headers
+                    )
+                    if repo_resp.status_code == 200:
+                        default_ref = repo_resp.json().get("default_branch", "main")
+                except Exception:
+                    # Fallback to "main" on any error here
+                    pass
+
+                dispatch_url = f"{GITHUB_API}/repos/{repo_name}/actions/workflows/{workflow_id}/dispatches"
+                resp = await client.post(
+                    dispatch_url, headers=headers, json={"ref": default_ref}
+                )
+
+            if resp.status_code in (200, 201, 202, 204):
+                self.log_view.write("[INFO] Workflow dispatch accepted by GitHub.")
+                # Refresh runs for the active workflow so the new run shows up soon.
+                workflow_index = getattr(self.workflow_list, "index", None)
+                if workflow_index is not None and 0 <= workflow_index < len(
+                    self.workflows
+                ):
+                    wf = self.workflows[workflow_index]
+                    await self.load_runs(repo_name, wf["id"], wf.get("name", ""))
+            else:
+                self.log_view.write(
+                    f"[ERROR] Failed to trigger workflow: HTTP {resp.status_code} - {resp.text}"
+                )
+        except Exception as exc:
+            self.log_view.write(f"[ERROR] Exception while triggering workflow: {exc}")
 
     async def fetch_run_details(self, repo_name: str, run_id: int):
         """Fetch additional details for a workflow run.
@@ -683,11 +802,62 @@ class CICDMonitorApp(App):
                 }
             )
 
-        return {"actor": actor, "duration": duration, "steps": steps_data}
+        return {
+            "actor": actor,
+            "duration": duration,
+            "steps": steps_data,
+            "job_conclusion": job.get("conclusion"),
+        }
 
     async def _do_rerun_job(self, run):
-        self.log_view.write(f"[ACTION] Re-running job '{run['name']}'...")
-        # Implement re-run logic here
+        """Request a re-run of the selected workflow run via GitHub's API."""
+
+        if not GITHUB_TOKEN:
+            self.log_view.write(
+                "[ERROR] GITHUB_TOKEN is not configured; cannot re-run."
+            )
+            return
+
+        repo_index = getattr(self.repo_list, "index", None)
+        if repo_index is None or not self.repos:
+            self.log_view.write("[WARN] No repository selected for re-run.")
+            return
+
+        repo_name = self.repos[repo_index]
+        run_id = run.get("id")
+        if not run_id:
+            self.log_view.write("[WARN] Selected run has no valid ID.")
+            return
+
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        self.log_view.write(
+            f"[ACTION] Requesting re-run for workflow run {run_id} in '{repo_name}'..."
+        )
+
+        try:
+            async with httpx.AsyncClient() as client:
+                url = f"{GITHUB_API}/repos/{repo_name}/actions/runs/{run_id}/rerun"
+                resp = await client.post(url, headers=headers)
+
+            if resp.status_code in (200, 201, 202, 204):
+                self.log_view.write("[INFO] Re-run request accepted by GitHub.")
+                # Refresh runs for the current workflow so status updates soon.
+                workflow_index = getattr(self.workflow_list, "index", None)
+                if workflow_index is not None and 0 <= workflow_index < len(
+                    self.workflows
+                ):
+                    wf = self.workflows[workflow_index]
+                    await self.load_runs(repo_name, wf["id"], wf.get("name", ""))
+            else:
+                self.log_view.write(
+                    f"[ERROR] Failed to request re-run: HTTP {resp.status_code} - {resp.text}"
+                )
+        except Exception as exc:
+            self.log_view.write(f"[ERROR] Exception while requesting re-run: {exc}")
 
 
 if __name__ == "__main__":

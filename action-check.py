@@ -1,3 +1,11 @@
+"""Huey-TUI GitHub Actions monitor.
+
+Clone and contact info:
+- GitHub: https://github.com/gregheffner
+- Website: https://greg.heffner.live
+- Blog: https://greg.heffner.live/blog.html
+"""
+
 import asyncio
 import os
 import random
@@ -10,13 +18,10 @@ from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, ListItem, ListView, Static
 
-# Load .env for GITHUB_TOKEN
 load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_API = "https://api.github.com"
-
-RUNS = []  # Will be filled after repo selection
 
 
 def remove_emojis(text: str) -> str:
@@ -44,7 +49,6 @@ def remove_emojis(text: str) -> str:
 
 class RepoList(ListView):
     def __init__(self, repos, **kwargs):
-        # Repos are passed in as full_name (e.g. "user/repo"); only show the repo name.
         super().__init__(
             *[
                 ListItem(Static(repo.split("/")[-1] if isinstance(repo, str) else repo))
@@ -202,7 +206,6 @@ class WrappedLog(Static):
         self.lines = []
 
     def write(self, text):
-        # Split text into lines and append
         for line in str(text).splitlines():
             self.lines.append(line)
         self.update("\n".join(self.lines))
@@ -213,7 +216,6 @@ class WrappedLog(Static):
 
 
 class CICDMonitorApp(App):
-    # Helper for pretty column headers
     @staticmethod
     def pretty_header(text, width=22, color="magenta"):
         line = "─" * width
@@ -239,11 +241,6 @@ class CICDMonitorApp(App):
         self.columns = ["repo-list", "workflow-list", "run-list"]
         self.focused_column = 0
         self._pending_action = None
-
-    async def on_mount(self):
-        print("CICDMonitorApp mounted")
-        # Set initial focus to repo-list
-        self.set_focus(self.repo_list)
 
     def action_focus_prev_column(self):
         if self.focused_column > 0:
@@ -317,13 +314,8 @@ class CICDMonitorApp(App):
             term_height = 24
         banner_width = max(banner_width, 60)
 
-        # Make the banner tall enough that vertical motion is obvious,
-        # but not so tall that it dominates smaller terminals.
         banner_height = max(9, min(14, term_height // 3))
 
-        # Derive a reasonable column header width from the banner/terminal width
-        # so that column names appear visually centered within their panes.
-        # Keep a sensible minimum to avoid overly narrow headers.
         column_width = max((banner_width // 4) - 4, 22)
 
         author_str = "[cyan]Created by Greg Heffner[/]"
@@ -373,7 +365,6 @@ class CICDMonitorApp(App):
 
         yield Footer()
 
-    # CSS_PATH = "cicd_monitor.tcss"
     selected_repo = reactive(None)
     selected_workflow = reactive(None)
     selected_run = reactive(None)
@@ -382,16 +373,14 @@ class CICDMonitorApp(App):
     runs = reactive([])
 
     async def on_mount(self):
-        print("CICDMonitorApp mounted")
         await self.load_repos()
         self.repo_list.index = 0
         self.workflow_list.index = 0
         self.run_list.index = 0
         self.update_log_view(0)
+        self.set_focus(self.repo_list)
 
     async def load_repos(self):
-        from zoneinfo import ZoneInfo
-
         if not GITHUB_TOKEN:
             self.repos = ["No GITHUB_TOKEN in .env"]
             return
@@ -404,7 +393,6 @@ class CICDMonitorApp(App):
             resp = await client.get(f"{GITHUB_API}/user/repos", headers=headers)
             if resp.status_code == 200:
                 all_repos = resp.json()
-                # Only include repos with at least one workflow
                 for repo in all_repos:
                     full_name = repo["full_name"]
                     wf_resp = await client.get(
@@ -418,8 +406,6 @@ class CICDMonitorApp(App):
                 self.repos = [f"Error: {resp.status_code}"]
         self.repo_list.clear()
         for repo in self.repos:
-            # Display only the short repo name (part after '/'),
-            # but keep the full name in self.repos for API calls.
             if isinstance(repo, str) and "/" in repo and not repo.startswith("Error"):
                 display = repo.split("/")[-1]
             else:
@@ -485,7 +471,6 @@ class CICDMonitorApp(App):
                 if resp.status_code == 200:
                     for run in resp.json().get("workflow_runs", []):
                         created_at = run.get("created_at", "?")
-                        # Format date for EST
                         try:
                             dt_utc = datetime.fromisoformat(
                                 created_at.replace("Z", "+00:00")
@@ -521,7 +506,6 @@ class CICDMonitorApp(App):
         self.update_log_view(0)
 
     async def on_list_view_highlighted(self, event):
-        # This event is called when the selection (highlight) changes
         idx = event.list_view.index
         if idx is None:
             return
@@ -538,7 +522,6 @@ class CICDMonitorApp(App):
         elif event.list_view.id == "run-list":
             await self.show_detailed_log(idx, open_browser=True)
 
-    # Keep on_list_view_selected for explicit selection (e.g., Enter key)
     async def on_list_view_selected(self, event):
         if event.list_view.id == "repo-list":
             repo_name = self.repos[event.list_view.index]
@@ -557,8 +540,6 @@ class CICDMonitorApp(App):
             self.log_view.write(self.runs[run_index]["log"])
 
     async def show_detailed_log(self, run_index, open_browser: bool = False):
-        """Show detailed information for a run in a compact, readable format."""
-
         self.log_view.clear()
 
         if not (0 <= run_index < len(self.runs)):
